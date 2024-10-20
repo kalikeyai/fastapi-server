@@ -228,7 +228,17 @@ async def chat_with_ai(request: ChatRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+@app.post("/reset")
+async def reset_context():
+    """Endpoint to reset the chat context (conversation memory)."""
+    try:
+        # Clear the conversation memory
+        memory.clear()
+        return JSONResponse(status_code=200, content={"message": "Chat context has been reset."})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(port))
