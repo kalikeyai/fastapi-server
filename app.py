@@ -193,15 +193,19 @@ async def extract_resume(file: UploadFile = File(...)):
         print(f"Unhandled Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/chat")
-async def chat_with_ai(request: ChatRequest):
+@app.post("/chat/{chat_type}")
+async def chat_with_ai(chat_type:str ,request: ChatRequest):
     """Chat with AI, retaining chat history."""
+    print(f"Received chat_type: {chat_type}")
     try:
         # Initialize Groq model
         llm = ChatGroq(groq_api_key=groq_api_key, model_name='llama3-70b-8192')
-
-        system_prompt = 'You are a friendly conversational chatbot'
-
+        if (chat_type == 'interviewer'):
+            system_prompt = 'You are a professional interviewer, taking interview for a job position, as an interviwer, your job is to evaluate the candidate & assess their skills & experience based on the information provided.'
+        elif(chat_type == 'summary'):
+            system_prompt = 'You are a professional writer who creates concise information out of answers received'
+        else:
+            system_prompt = 'You are a friendly conversational bot'
 
         # Construct a chat prompt template using various components
         prompt = ChatPromptTemplate.from_messages(
