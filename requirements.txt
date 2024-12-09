@@ -10,3 +10,4 @@ langchain-groq
 langchain
 pydantic
 python-multipart
+langchain-huggingface
