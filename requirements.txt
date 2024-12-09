@@ -6,7 +6,6 @@ PyPDF2
 pinecone-client
 langchain-community
 langchain-pinecone
-langchain-huggingface
 langchain-groq
 langchain
 pydantic
