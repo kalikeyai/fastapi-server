@@ -103,7 +103,7 @@ async def ask_question(index_name: str, document_id: str, request: QuestionReque
         vector_store = initialize_vector_store(index_name)
 
         # Set up conversational chain
-        llm = ChatGroq(groq_api_key=groq_api_key, model_name='llama-3.2-90b-vision-preview')
+        llm = ChatGroq(groq_api_key=groq_api_key, model_name='llama-3.3-70b-versatile')
         memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
         chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
