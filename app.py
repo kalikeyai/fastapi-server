@@ -1,54 +1,57 @@
 import os
+import logging
+from typing import List
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from dotenv import load_dotenv
 import docx2txt
 from PyPDF2 import PdfReader
 from pinecone import Pinecone, ServerlessSpec
 from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
 from langchain_pinecone import PineconeVectorStore
-
 from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory, ConversationBufferWindowMemory
-
+from langchain.memory import ConversationBufferWindowMemory
 from langchain_groq import ChatGroq
 from langchain.text_splitter import CharacterTextSplitter
-from pydantic import BaseModel
-
-
-
-
 # Load environment variables
 load_dotenv()
-
-# Initialize FastAPI app
-app = FastAPI()
-
-# Initialize Pinecone client
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+# Retrieve environment variables and validate them
 pinecone_api_key = os.getenv("PINECONE_API_KEY")
+if not pinecone_api_key:
+    raise ValueError("PINECONE_API_KEY must be set as an environment variable.")
 groq_api_key = os.getenv("GROQ_API_KEY")
-port = os.getenv('PORT')
-
-# Define Pinecone client instance
+if not groq_api_key:
+    raise ValueError("GROQ_API_KEY must be set as an environment variable.")
+port = os.getenv('PORT', '8000')
+try:
+    port = int(port)
+except ValueError:
+    raise ValueError("PORT environment variable must be an integer.")
+# Create FastAPI instance
+app = FastAPI()
+# Initialize Pinecone client
 pc = Pinecone(api_key=pinecone_api_key)
-
-# Define embedding function and dimension
-embedding_model_name = "all-MiniLM-L6-v2"
-embedding_function = SentenceTransformerEmbeddings(model_name=embedding_model_name)
+# Embedding configuration
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+embedding_function = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL_NAME)
 sample_embedding = embedding_function.embed_query("test")
 embedding_dim = len(sample_embedding)
-conversational_memory_length = 10  # number of previous messages the chatbot will remember during the conversation
-
+# Conversational memory configuration
+CONVERSATIONAL_MEMORY_LENGTH = 10  # Number of previous messages to remember
 memory = ConversationBufferWindowMemory(
-    k=conversational_memory_length, 
-    memory_key="chat_history", 
+    k=CONVERSATIONAL_MEMORY_LENGTH,
+    memory_key="chat_history",
     return_messages=True
 )
-
-# Initialize vector store
-def initialize_vector_store(index_name):
+def initialize_vector_store(index_name: str) -> PineconeVectorStore:
     """Create and return a Pinecone vector store for the given index name."""
-    if index_name not in pc.list_indexes().names():
+    existing_indexes = pc.list_indexes().names()
+    if index_name not in existing_indexes:
+        logger.info(f"Creating new Pinecone index: {index_name}")
         pc.create_index(
             name=index_name,
             dimension=embedding_dim,
@@ -56,83 +59,69 @@ def initialize_vector_store(index_name):
             spec=ServerlessSpec(cloud='aws', region='us-east-1')
         )
     return PineconeVectorStore(index_name=index_name, embedding=embedding_function)
-
-# Pydantic model for question requests
+def read_document(file: UploadFile) -> str:
+    """Read the uploaded file and return its text content."""
+    if file.content_type == "application/pdf":
+        pdf_reader = PdfReader(file.file)
+        return "".join([page.extract_text() for page in pdf_reader.pages])
+    elif file.content_type == "text/plain":
+        return (file.file.read()).decode("utf-8")
+    elif file.content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        return docx2txt.process(file.file)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file type.")
+def create_chain(vector_store: PineconeVectorStore, document_id: str) -> ConversationalRetrievalChain:
+    """Create a conversational retrieval chain for querying documents."""
+    llm = ChatGroq(groq_api_key=groq_api_key, model_name='llama-3.3-70b-versatile')
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        chain_type='stuff',
+        retriever=vector_store.as_retriever(search_kwargs={"k": 2, "namespace": document_id}),
+        memory=memory
+    )
+    return chain
 class QuestionRequest(BaseModel):
     question: str
-
-
-# Document upload endpoint with namespaces for each candidate
 @app.post("/upload-document/{index_name}/{document_id}")
 async def upload_document(index_name: str, document_id: str, file: UploadFile = File(...)):
-    """Endpoint to upload and process a document into a specific story's index under a story's namespace."""
+    """Endpoint to upload and process a document into a Pinecone index under a given namespace."""
     try:
-        # Initialize vector store for the company
+        logger.info(f"Uploading document to index '{index_name}' under namespace '{document_id}'...")
         vector_store = initialize_vector_store(index_name)
-
-        # Read and process the document
-        if file.content_type == "application/pdf":
-            pdf_reader = PdfReader(file.file)
-            text = "".join([page.extract_text() for page in pdf_reader.pages])
-        elif file.content_type == "text/plain":
-            text = (await file.read()).decode("utf-8")
-        elif file.content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-            text = docx2txt.process(file.file)
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported file type")
-
+        text = read_document(file)
         # Split text into chunks
         text_splitter = CharacterTextSplitter(separator="\n", chunk_size=1000, chunk_overlap=200, length_function=len)
-        text_chunks = text_splitter.split_text(text)
-        
-        # Add text chunks to Pinecone under the candidate's namespace
+        text_chunks: List[str] = text_splitter.split_text(text)
         vector_store.add_texts(text_chunks, namespace=document_id)
-        
+        logger.info("Document processed and uploaded successfully.")
         return JSONResponse(status_code=200, content={"message": "Document processed and uploaded successfully"})
     except Exception as e:
-        print(e)
+        logger.error(f"Error uploading document: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# Query endpoint for a candidate's namespace
 @app.post("/query-doc/{index_name}/{document_id}")
 async def ask_question(index_name: str, document_id: str, request: QuestionRequest):
-    """Endpoint to query a specific candidate's document in the specified company's Pinecone index."""
+    """Query a document within a given Pinecone index namespace."""
     try:
-        # Initialize vector store for the company
+        logger.info(f"Querying index '{index_name}', namespace '{document_id}' with question: {request.question}")
         vector_store = initialize_vector_store(index_name)
-
-        # Set up conversational chain
-        llm = ChatGroq(groq_api_key=groq_api_key, model_name='llama-3.3-70b-versatile')
-        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-        chain = ConversationalRetrievalChain.from_llm(
-            llm=llm,
-            chain_type='stuff',
-            retriever=vector_store.as_retriever(search_kwargs={"k": 2, "namespace": document_id}),
-            memory=memory
-        )
-
-        # Get response for the query
+        chain = create_chain(vector_store, document_id)
         response = chain.invoke({"question": request.question, "chat_history": []})
+        logger.info("Query processed successfully.")
         return JSONResponse(status_code=200, content={"answer": response["answer"]})
     except Exception as e:
+        logger.error(f"Error querying document: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.post("/reset")
 async def reset_context():
-    """Endpoint to reset the chat context (conversation memory)."""
+    """Reset the chat context (conversation memory)."""
     try:
-        # Clear the conversation memory
         memory.clear()
+        logger.info("Chat context has been reset.")
         return JSONResponse(status_code=200, content={"message": "Chat context has been reset."})
     except Exception as e:
+        logger.error(f"Error resetting chat context: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(port))
-
-
-
-
+    logger.info("Starting the server...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
