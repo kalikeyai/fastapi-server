@@ -111,6 +111,29 @@ async def ask_question(index_name: str, document_id: str, request: QuestionReque
     except Exception as e:
         logger.error(f"Error querying document: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.delete("/delete-namespace/{index_name}/{namespace}")
+async def delete_namespace(index_name: str, namespace: str):
+    """Delete a namespace from a given Pinecone index."""
+    try:
+        logger.info(f"Deleting namespace '{namespace}' from index '{index_name}'...")
+        
+        # Check if the index exists
+        existing_indexes = pc.list_indexes().names()
+        if index_name not in existing_indexes:
+            raise HTTPException(status_code=404, detail=f"Index '{index_name}' does not exist.")
+
+        # Delete all vectors in the namespace
+        index = pc.Index(index_name,"https://stories-uizc1dc.svc.aped-4627-b74a.pinecone.io")
+        index.delete(delete_all=True, namespace=namespace)
+
+        logger.info(f"Namespace '{namespace}' deleted successfully from index '{index_name}'.")
+        return JSONResponse(status_code=200, content={"message": f"Namespace '{namespace}' deleted successfully."})
+    except Exception as e:
+        logger.error(f"Error deleting namespace: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/reset")
 async def reset_context():
     """Reset the chat context (conversation memory)."""
