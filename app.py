@@ -87,7 +87,7 @@ def create_chain(vector_store: PineconeVectorStore, document_id: str) -> Convers
     llm = ChatOpenAI(
         openai_api_base="https://openrouter.ai/api/v1",
         openai_api_key=openrouter_api_key,
-        model_name="openai/gpt-3.5-turbo",  # Replace with desired OpenRouter model
+        model_name="x-ai/grok-2-1212",  # Replace with desired OpenRouter model
         temperature=0.7
     )
     chain = ConversationalRetrievalChain.from_llm(
