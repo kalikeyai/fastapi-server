@@ -4,10 +4,11 @@ python-dotenv
 docx2txt
 PyPDF2
 pinecone-client
+langchain
 langchain-community
 langchain-pinecone
-langchain-groq
-langchain
+langchain-huggingface
 pydantic
 python-multipart
-langchain-huggingface
+sentence-transformers
+openai
