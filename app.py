@@ -93,7 +93,7 @@ def create_chain(vector_store: PineconeVectorStore, document_id: str) -> Convers
     chain = ConversationalRetrievalChain.from_llm(
         llm=llm,
         chain_type='stuff',
-        retriever=vector_store.as_retriever(search_kwargs={"k": 2, "namespace": document_id}),
+        retriever=vector_store.as_retriever(search_kwargs={"k": 20, "namespace": document_id}),
         memory=memory
     )
     return chain
