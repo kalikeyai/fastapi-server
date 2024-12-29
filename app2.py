@@ -1,164 +1,155 @@
 import os
 import logging
-import requests
-from typing import Dict
-from fastapi import FastAPI, HTTPException
+from typing import List
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+import docx2txt
+from PyPDF2 import PdfReader
+from pinecone import Pinecone, ServerlessSpec
+from langchain.embeddings import OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.chat_models import ChatOpenAI
-from langchain.chains import ConversationalRetrievalChain
-
+from langchain.text_splitter import CharacterTextSplitter
 # Load environment variables
 load_dotenv()
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Environment variables
-openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
-bubble_api_url = os.getenv("BUBBLE_API_URL")  # Bubble Data API URL
-bubble_api_key = os.getenv("BUBBLE_API_KEY")  # Bubble API Key
-
-if not openrouter_api_key or not bubble_api_url or not bubble_api_key:
-    raise ValueError("OPENROUTER_API_KEY, BUBBLE_API_URL, and BUBBLE_API_KEY must be set as environment variables.")
-
-port = int(os.getenv('PORT', '8000'))
-
-# FastAPI instance
+# Retrieve environment variables and validate them
+pinecone_api_key = os.getenv("PINECONE_API_KEY")
+if not pinecone_api_key:
+    raise ValueError("PINECONE_API_KEY must be set as an environment variable.")
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if not openai_api_key:
+    raise ValueError("OPENAI_API_KEY must be set as an environment variable.")
+port = os.getenv('PORT', '8000')
+try:
+    port = int(port)
+except ValueError:
+    raise ValueError("PORT environment variable must be an integer.")
+# Create FastAPI instance
 app = FastAPI()
-
-# Pydantic Models
-class CharacterProfile(BaseModel):
-    name: str
-    description: str
-    personality: str
-
-class QuestionRequest(BaseModel):
-    question: str
-    user_id: str
-    character_name: str
-
-# Character profiles stored in memory
-character_profiles: Dict[str, Dict] = {}
-
-# LLM Configuration
-def create_llm():
-    return ChatOpenAI(
-        openai_api_base="https://openrouter.ai/api/v1",
-        openai_api_key=openrouter_api_key,
-        model_name="openai/gpt-3.5-turbo",
+# Initialize Pinecone client
+pc = Pinecone(api_key=pinecone_api_key)
+# Embedding configuration using OpenAI
+# You can change the model to "text-embedding-ada-002" or something else you prefer.
+embedding_function = OpenAIEmbeddings(model="text-embedding-3-large", openai_api_key=openai_api_key)
+sample_embedding = embedding_function.embed_query("test")
+embedding_dim = len(sample_embedding)
+# Conversational memory configuration
+CONVERSATIONAL_MEMORY_LENGTH = 10  # Number of previous messages to remember
+memory = ConversationBufferWindowMemory(
+    k=CONVERSATIONAL_MEMORY_LENGTH,
+    memory_key="chat_history",
+    return_messages=True
+)
+def initialize_vector_store(index_name: str) -> PineconeVectorStore:
+    """Create and return a Pinecone vector store for the given index name."""
+    existing_indexes = pc.list_indexes().names()
+    if index_name not in existing_indexes:
+        logger.info(f"Creating new Pinecone index: {index_name}")
+        pc.create_index(
+            name=index_name,
+            dimension=embedding_dim,
+            metric="cosine",
+            spec=ServerlessSpec(cloud='aws', region='us-east-1')
+        )
+    return PineconeVectorStore(index_name=index_name, embedding=embedding_function)
+def read_document(file: UploadFile) -> str:
+    """Read the uploaded file and return its text content."""
+    if file.content_type == "application/pdf":
+        pdf_reader = PdfReader(file.file)
+        return "".join([page.extract_text() for page in pdf_reader.pages])
+    elif file.content_type == "text/plain":
+        return (file.file.read()).decode("utf-8")
+    elif file.content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        return docx2txt.process(file.file)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file type.")
+def create_chain(vector_store: PineconeVectorStore, document_id: str) -> ConversationalRetrievalChain:
+    """Create a conversational retrieval chain for querying documents with OpenAI GPT-4."""
+    llm = ChatOpenAI(
+        openai_api_key=openai_api_key,
+        model_name="gpt-4o",  # Using GPT-4 directly from OpenAI
         temperature=0.7
     )
-
-# Bubble API Functions
-def fetch_user_context(user_id: str, character_name: str) -> str:
-    """Fetch user context from Bubble API."""
-    endpoint = f"{bubble_api_url}/obj/user_contexts"  # Bubble API endpoint
-    headers = {"Authorization": f"Bearer {bubble_api_key}"}
-    params = {"constraints": f"[{{'key':'user_id','constraint_type':'equals','value':'{user_id}'}},"
-                             f"{{'key':'character_name','constraint_type':'equals','value':'{character_name}'}}]"}
-    response = requests.get(endpoint, headers=headers, params={"constraints": params})
-    
-    if response.status_code != 200:
-        logger.error(f"Error fetching user context: {response.text}")
-        raise HTTPException(status_code=500, detail="Failed to fetch user context.")
-
-    results = response.json().get("response", {}).get("results", [])
-    if results:
-        return results[0].get("context", "")
-    return ""
-
-def save_user_context(user_id: str, character_name: str, context: str):
-    """Save or update user context to Bubble API."""
-    endpoint = f"{bubble_api_url}/obj/user_contexts"
-    headers = {"Authorization": f"Bearer {bubble_api_key}", "Content-Type": "application/json"}
-    
-    data = {
-        "user_id": user_id,
-        "character_name": character_name,
-        "context": context
-    }
-
-    # Try saving or updating the context
-    response = requests.post(endpoint, headers=headers, json=data)
-    if response.status_code not in [200, 201]:
-        logger.error(f"Error saving user context: {response.text}")
-        raise HTTPException(status_code=500, detail="Failed to save user context.")
-
-# Context Management
-def load_user_context(user_id: str, character_name: str) -> ConversationBufferWindowMemory:
-    """Load context for a user and character from Bubble API."""
-    memory = ConversationBufferWindowMemory(
-        k=10, memory_key="chat_history", return_messages=True
-    )
-    context = fetch_user_context(user_id, character_name)
-    if context:
-        memory.load_memory_variables({"chat_history": context})
-    return memory
-
-# Endpoints
-@app.post("/add-character-profile")
-async def add_character_profile(profile: CharacterProfile):
-    """Add a digital character profile."""
-    if profile.name in character_profiles:
-        raise HTTPException(status_code=400, detail="Character already exists.")
-    character_profiles[profile.name] = {
-        "description": profile.description,
-        "personality": profile.personality
-    }
-    logger.info(f"Character '{profile.name}' added.")
-    return {"message": f"Character '{profile.name}' added successfully."}
-
-@app.post("/query-character")
-async def query_character(request: QuestionRequest):
-    """Chat with a character while maintaining user-specific memory."""
-    if request.character_name not in character_profiles:
-        raise HTTPException(status_code=404, detail="Character not found.")
-    
-    # Retrieve character and user-specific memory
-    character = character_profiles[request.character_name]
-    memory = load_user_context(request.user_id, request.character_name)
-
-    # LLM with character personality prompt
-    llm = create_llm()
-    system_message = (
-        f"You are {character['name']}. {character['description']}. "
-        f"Your personality: {character['personality']}."
-    )
-
     chain = ConversationalRetrievalChain.from_llm(
         llm=llm,
-        chain_type="stuff",
-        retriever=None,
+        chain_type='stuff',
+        retriever=vector_store.as_retriever(search_kwargs={"k": 20, "namespace": document_id}),
         memory=memory
     )
-
-    # Invoke chain
-    response = chain.invoke({
-        "question": request.question,
-        "system_message": system_message
-    })
-
-    # Save updated context to Bubble API
-    updated_context = memory.load_memory_variables({})["chat_history"]
-    save_user_context(request.user_id, request.character_name, updated_context)
-    return {"answer": response['answer']}
-
-@app.get("/list-characters")
-async def list_characters():
-    """List all available characters."""
-    return {"characters": list(character_profiles.keys())}
-
-@app.post("/reset-user-context")
-async def reset_user_context(user_id: str, character_name: str):
-    """Reset chat context for a specific user and character."""
-    save_user_context(user_id, character_name, "")  # Clear context in Bubble API
-    logger.info(f"Context reset for user '{user_id}' and character '{character_name}'.")
-    return {"message": "Chat context reset successfully."}
-
+    return chain
+class QuestionRequest(BaseModel):
+    question: str
+@app.post("/upload-document/{index_name}/{document_id}")
+async def upload_document(index_name: str, document_id: str, file: UploadFile = File(...)):
+    """Endpoint to upload and process a document into a Pinecone index under a given namespace."""
+    try:
+        logger.info(f"Uploading document to index '{index_name}' under namespace '{document_id}'...")
+        vector_store = initialize_vector_store(index_name)
+        text = read_document(file)
+        # Split text into chunks
+        text_splitter = CharacterTextSplitter(
+            separator="\n",
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len
+        )
+        text_chunks: List[str] = text_splitter.split_text(text)
+        vector_store.add_texts(text_chunks, namespace=document_id)
+        logger.info("Document processed and uploaded successfully.")
+        return JSONResponse(
+            status_code=200,
+            content={"message": "Document processed and uploaded successfully"}
+        )
+    except Exception as e:
+        logger.error(f"Error uploading document: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/query-doc/{index_name}/{document_id}")
+async def ask_question(index_name: str, document_id: str, request: QuestionRequest):
+    """Query a document within a given Pinecone index namespace."""
+    try:
+        logger.info(f"Querying index '{index_name}', namespace '{document_id}' with question: {request.question}")
+        vector_store = initialize_vector_store(index_name)
+        chain = create_chain(vector_store, document_id)
+        response = chain.invoke({"question": request.question, "chat_history": []})
+        logger.info("Query processed successfully.")
+        return JSONResponse(status_code=200, content={"answer": response["answer"]})
+    except Exception as e:
+        logger.error(f"Error querying document: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+@app.delete("/delete-namespace/{index_name}/{namespace}")
+async def delete_namespace(index_name: str, namespace: str):
+    """Delete a namespace from a given Pinecone index."""
+    try:
+        logger.info(f"Deleting namespace '{namespace}' from index '{index_name}'...")
+        # Check if the index exists
+        existing_indexes = pc.list_indexes().names()
+        if index_name not in existing_indexes:
+            raise HTTPException(status_code=404, detail=f"Index '{index_name}' does not exist.")
+        # Delete all vectors in the namespace
+        index = pc.Index(index_name, "https://stories-uizc1dc.svc.aped-4627-b74a.pinecone.io")
+        index.delete(delete_all=True, namespace=namespace)
+        logger.info(f"Namespace '{namespace}' deleted successfully from index '{index_name}'.")
+        return JSONResponse(status_code=200, content={"message": f"Namespace '{namespace}' deleted successfully."})
+    except Exception as e:
+        logger.error(f"Error deleting namespace: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/reset")
+async def reset_context():
+    """Reset the chat context (conversation memory)."""
+    try:
+        memory.clear()
+        logger.info("Chat context has been reset.")
+        return JSONResponse(status_code=200, content={"message": "Chat context has been reset."})
+    except Exception as e:
+        logger.error(f"Error resetting chat context: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting the server...")
